@@ -28,13 +28,16 @@ TinyGPSPlus gps;
 HardwareSerial GPSSerial(1);
 #define GPS_RX 17
 #define GPS_TX 16
+double gpsAltitude = 0.0;
+double gpsMaxAltitude = 0.0;
+bool gpsAltitudeValid = false;
 
 #define SERVO_PITCH_PIN 0
 #define SERVO_YAW_PIN   1
 #define ALPHA 0.98
 
 #define PARACHUTE_SERVO_PIN  2    // must differ from SERVO_PITCH_PIN(0) and SERVO_YAW_PIN(1)
-#define PARACHUTE_OPEN_POS   120
+#define PARACHUTE_OPEN_POS   150
 #define PARACHUTE_CLOSED_POS 70
 #define PARACHUTE_DROP_THRESHOLD 5.0  // metres of altitude drop before auto-deploy
 
@@ -73,6 +76,10 @@ String dateTime;
 bool loggingActive = false;
 File logFile;
 String logFileName = "";
+#define LOG_BUFFER_SIZE 512
+char logBuffer[LOG_BUFFER_SIZE];
+size_t bufferPos = 0;
+
 
 bool liveUpdateActive = false;
 
@@ -114,6 +121,12 @@ void tryInit(String& errorMsg) {
                   Adafruit_BMP280::STANDBY_MS_500);
 
   basePressure = bmp.readPressure() / 100;
+
+  pinMode(SERVO_PITCH_PIN, OUTPUT);
+  pinMode(SERVO_YAW_PIN, OUTPUT);
+  pinMode(PARACHUTE_SERVO_PIN, OUTPUT);
+
+  delay(500);
 
   // --- Attach servos using direct LEDC ---
   if (!ledcAttach(SERVO_PITCH_PIN, SERVO_FREQ, PWM_RES)) {
@@ -163,7 +176,8 @@ void calibrateIMU() {
 
   sensors_event_t a, g, temp;
   mpu.getEvent(&a, &g, &temp);
-  pitch = atan2(a.acceleration.z, a.acceleration.y) * RAD_TO_DEG;
+  pitch = atan2(a.acceleration.z, sqrt(a.acceleration.x * a.acceleration.x +
+                                        a.acceleration.y * a.acceleration.y)) * RAD_TO_DEG;
   yaw   = atan2(a.acceleration.x, sqrt(a.acceleration.z * a.acceleration.z +
                                         a.acceleration.y * a.acceleration.y)) * RAD_TO_DEG;
   roll  = 0.0;
@@ -191,7 +205,8 @@ void updateIMU() {
                         a.acceleration.y * a.acceleration.y +
                         a.acceleration.z * a.acceleration.z);
 
-  float accelPitch = atan2(a.acceleration.z, a.acceleration.y) * RAD_TO_DEG;
+  float accelPitch = atan2(a.acceleration.z, sqrt(a.acceleration.x * a.acceleration.x +
+                                        a.acceleration.y * a.acceleration.y)) * RAD_TO_DEG;
   float accelYaw   = atan2(a.acceleration.x, sqrt(a.acceleration.z * a.acceleration.z +
                                                     a.acceleration.y * a.acceleration.y)) * RAD_TO_DEG;
 
@@ -208,6 +223,17 @@ void updateIMU() {
 void updateGPS() {
   while (GPSSerial.available() > 0) {
     gps.encode(GPSSerial.read());
+  }
+  
+  // Extract GPS altitude when valid
+  if (gps.altitude.isValid()) {
+    gpsAltitude = gps.altitude.meters();
+    gpsAltitudeValid = true;
+    if (gpsAltitude > gpsMaxAltitude) {
+      gpsMaxAltitude = gpsAltitude;
+    }
+  } else {
+    gpsAltitudeValid = false;
   }
 }
 
@@ -491,7 +517,7 @@ void handleLogging() {
       server.send(500, "text/plain", "Failed to create log file");
       return;
     }
-    logFile.println("time,pressure,altitude,accX,accY,accZ,gyroX,gyroY,gyroZ,pitch,roll,yaw");
+    logFile.println("time,pressure,altitude,accX,accY,accZ,gyroX,gyroY,gyroZ,pitch,roll,yaw,gpsAlt");
     logFile.flush();
     calibrateIMU();
     loggingActive = true;
@@ -527,6 +553,7 @@ void handleToggleArm() {
   if (armed) {
     // capture current altitude as the reference peak when arming
     maxAltitude = bmp.readAltitude(basePressure);
+    gpsMaxAltitude = gpsAltitude;
   }
   server.send(200, "text/plain", armed ? "Armed" : "Disarmed");
 }
@@ -581,35 +608,58 @@ void handleData() {
              gps.time.hour(), gps.time.minute(), gps.time.second());
   }
 
-  String json = "{";
-  json += "\"time\":"         + String(timeSec)               + ",";
-  json += "\"pressure\":"     + String(pressure)              + ",";
-  json += "\"altitude\":"     + String(altitude)              + ",";
-  json += "\"accX\":"         + String(a.acceleration.x)      + ",";
-  json += "\"accY\":"         + String(a.acceleration.y)      + ",";
-  json += "\"accZ\":"         + String(a.acceleration.z)      + ",";
-  json += "\"gyroX\":"        + String(g.gyro.x - offsetGyrX) + ",";
-  json += "\"gyroY\":"        + String(g.gyro.y - offsetGyrY) + ",";
-  json += "\"gyroZ\":"        + String(g.gyro.z - offsetGyrZ) + ",";
-  json += "\"pitch\":"        + String(pitch)                 + ",";
-  json += "\"roll\":"         + String(roll)                  + ",";
-  json += "\"yaw\":"          + String(yaw)                   + ",";
-  json += "\"rssiWiFi\":"     + String(rssiWiFi)              + ",";
-  json += "\"distanceWiFi\":" + String(distanceWiFi)          + ",";
-  json += "\"gpsFix\":"       + String(gpsFix ? "true" : "false") + ",";
-  json += "\"gpsLat\":"       + String(gpsLat, 6)             + ",";
-  json += "\"gpsLng\":"       + String(gpsLng, 6)             + ",";
-  json += "\"gpsAlt\":"       + String(gpsAlt, 1)             + ",";
-  json += "\"gpsSats\":"      + String(gpsSats)               + ",";
-  json += "\"gpsTime\":\"" + String(gpsTimeBuf) + "\"";
-  json += "}";
+  // String json = "{";
+  // json += "\"time\":"         + String(timeSec)               + ",";
+  // json += "\"pressure\":"     + String(pressure)              + ",";
+  // json += "\"altitude\":"     + String(altitude)              + ",";
+  // json += "\"accX\":"         + String(a.acceleration.x)      + ",";
+  // json += "\"accY\":"         + String(a.acceleration.y)      + ",";
+  // json += "\"accZ\":"         + String(a.acceleration.z)      + ",";
+  // json += "\"gyroX\":"        + String(g.gyro.x - offsetGyrX) + ",";
+  // json += "\"gyroY\":"        + String(g.gyro.y - offsetGyrY) + ",";
+  // json += "\"gyroZ\":"        + String(g.gyro.z - offsetGyrZ) + ",";
+  // json += "\"pitch\":"        + String(pitch)                 + ",";
+  // json += "\"roll\":"         + String(roll)                  + ",";
+  // json += "\"yaw\":"          + String(yaw)                   + ",";
+  // json += "\"rssiWiFi\":"     + String(rssiWiFi)              + ",";
+  // json += "\"distanceWiFi\":" + String(distanceWiFi)          + ",";
+  // json += "\"gpsFix\":"       + String(gpsFix ? "true" : "false") + ",";
+  // json += "\"gpsLat\":"       + String(gpsLat, 6)             + ",";
+  // json += "\"gpsLng\":"       + String(gpsLng, 6)             + ",";
+  // json += "\"gpsAlt\":"       + String(gpsAlt, 1)             + ",";
+  // json += "\"gpsSats\":"      + String(gpsSats)               + ",";
+  // json += "\"gpsTime\":\"" + String(gpsTimeBuf) + "\"";
+  // json += "}";
 
-  server.send(200, "application/json", json);
+  // server.send(200, "application/json", json);
+  char jsonBuffer[512];
+  snprintf(jsonBuffer, sizeof(jsonBuffer),
+  "{\"time\":%.3f,\"pressure\":%.1f,\"altitude\":%.2f,\"accX\":%.2f,\"accY\":%.2f,\"accZ\":%.2f,"
+  "\"gyroX\":%.2f,\"gyroY\":%.2f,\"gyroZ\":%.2f,\"pitch\":%.2f,\"roll\":%.2f,\"yaw\":%.2f,"
+  "\"rssiWiFi\":%d,\"distanceWiFi\":%.2f,\"gpsFix\":%s,\"gpsLat\":%.6f,\"gpsLng\":%.6f,"
+  "\"gpsAlt\":%.1f,\"gpsSats\":%d,\"gpsTime\":\"%s\"}",
+  timeSec, pressure, altitude,
+  a.acceleration.x, a.acceleration.y, a.acceleration.z,
+  g.gyro.x - offsetGyrX, g.gyro.y - offsetGyrY, g.gyro.z - offsetGyrZ,
+  pitch, roll, yaw,
+  rssiWiFi, distanceWiFi,
+  gpsFix ? "true" : "false", gpsLat, gpsLng, gpsAlt, gpsSats, gpsTimeBuf);
+
+  server.send(200, "application/json", jsonBuffer);
 }
 
 void handleLiveToggle() {
   liveUpdateActive = !liveUpdateActive;
   server.send(200, "text/plain", liveUpdateActive ? "Live ON" : "Live OFF");
+}
+
+
+void flushLogBuffer() {
+  if (bufferPos > 0 && logFile) {
+    logFile.write((const uint8_t*)logBuffer, bufferPos);
+    logFile.flush();  // Only flush when buffer is full
+    bufferPos = 0;
+  }
 }
 
 // ── Setup & loop ─────────────────────────────────────────────────────────────
@@ -651,10 +701,22 @@ void setup() {
 }
 
 void loop() {
-  server.handleClient();
+  static uint32_t lastServerHandle = 0;
+  if (millis() - lastServerHandle > 50) {  // Max 20 Hz for web
+    server.handleClient();
+    lastServerHandle = millis();
+  }
+
   updateGPS();
 
   if (initError.isEmpty()) {
+    // ── Read sensors ONCE ───────────────────────────────────────────────────
+    sensors_event_t a, g, temp;
+    mpu.getEvent(&a, &g, &temp);
+    float pressure   = bmp.readPressure() / 100;
+    float altitude   = bmp.readAltitude(basePressure);
+    float timeSec    = (millis() - startTime) / 1000.0;
+
     updateIMU();
 
     if (servoActive) {
@@ -666,14 +728,13 @@ void loop() {
 
     // ── Auto-deploy parachute ─────────────────────────────────────────────────
     if (armed && !parachuteOpen) {
-      float currentAltitude = bmp.readAltitude(basePressure);
-      if (currentAltitude > maxAltitude) {
-        maxAltitude = currentAltitude;          // track the peak
-      } else if ((maxAltitude - currentAltitude) >= PARACHUTE_DROP_THRESHOLD) {
-        parachuteOpen = true;
+      if (altitude > maxAltitude) {
+        maxAltitude = altitude;      
+      } else if (((maxAltitude - altitude) >= PARACHUTE_DROP_THRESHOLD) || (gpsAltitudeValid && ((gpsMaxAltitude - gpsAltitude) >= PARACHUTE_DROP_THRESHOLD))) {
         setServoAngle(PARACHUTE_SERVO_PIN, PARACHUTE_OPEN_POS);
         
         // NEW: When parachute auto‑deploys, disable stabilization and center servos
+        parachuteOpen = true;
         servoActive = false;
         setServoAngle(SERVO_PITCH_PIN, 90 + SERVO_PITCH_TRIM);
         setServoAngle(SERVO_YAW_PIN, 90 + SERVO_YAW_TRIM);
@@ -681,25 +742,43 @@ void loop() {
     }
     // ─────────────────────────────────────────────────────────────────────────
 
-    if (loggingActive && logFile) {
-      float timeSec = (millis() - startTime) / 1000.0;
-      sensors_event_t a, g, temp;
-      mpu.getEvent(&a, &g, &temp);
+    // if (loggingActive && logFile) {
+    //   float timeSec = (millis() - startTime) / 1000.0;
+    //   sensors_event_t a, g, temp;
+    //   mpu.getEvent(&a, &g, &temp);
 
-      logFile.print(timeSec);                        logFile.print(",");
-      logFile.print(bmp.readPressure() / 100);       logFile.print(",");
-      logFile.print(bmp.readAltitude(basePressure)); logFile.print(",");
-      logFile.print(a.acceleration.x);               logFile.print(",");
-      logFile.print(a.acceleration.y);               logFile.print(",");
-      logFile.print(a.acceleration.z);               logFile.print(",");
-      logFile.print(g.gyro.x - offsetGyrX);          logFile.print(",");
-      logFile.print(g.gyro.y - offsetGyrY);          logFile.print(",");
-      logFile.print(g.gyro.z - offsetGyrZ);          logFile.print(",");
-      logFile.print(pitch);                          logFile.print(",");
-      logFile.print(roll);                           logFile.print(",");
-      logFile.print(yaw);
-      logFile.print("\r\n");
-      logFile.flush();
+    //   logFile.print(timeSec);                        logFile.print(",");
+    //   logFile.print(bmp.readPressure() / 100);       logFile.print(",");
+    //   logFile.print(bmp.readAltitude(basePressure)); logFile.print(",");
+    //   logFile.print(a.acceleration.x);               logFile.print(",");
+    //   logFile.print(a.acceleration.y);               logFile.print(",");
+    //   logFile.print(a.acceleration.z);               logFile.print(",");
+    //   logFile.print(g.gyro.x - offsetGyrX);          logFile.print(",");
+    //   logFile.print(g.gyro.y - offsetGyrY);          logFile.print(",");
+    //   logFile.print(g.gyro.z - offsetGyrZ);          logFile.print(",");
+    //   logFile.print(pitch);                          logFile.print(",");
+    //   logFile.print(roll);                           logFile.print(",");
+    //   logFile.print(yaw);
+    //   logFile.print("\r\n");
+    //   logFile.flush();
+    // }
+
+    if (loggingActive && logFile) {
+      int written = snprintf(logBuffer + bufferPos, LOG_BUFFER_SIZE - bufferPos,
+        "%.3f,%.1f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f\n",
+        timeSec, pressure, altitude,
+        a.acceleration.x, a.acceleration.y, a.acceleration.z,
+        g.gyro.x - offsetGyrX, g.gyro.y - offsetGyrY, g.gyro.z - offsetGyrZ,
+        pitch, roll, yaw,
+        gpsAltitude);
+      
+      bufferPos += written;
+      if (bufferPos >= LOG_BUFFER_SIZE - 100) flushLogBuffer();
     }
+
   }
 }
+
+
+
+
